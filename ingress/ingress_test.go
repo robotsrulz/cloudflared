@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/ipaccess"
@@ -208,6 +208,14 @@ ingress:
 			args: args{rawYAML: `
 ingress:
  - service: http_status:asdf
+`},
+			wantErr: true,
+		},
+		{
+			name: "Invalid HTTP status code",
+			args: args{rawYAML: `
+ingress:
+ - service: http_status:8080
 `},
 			wantErr: true,
 		},

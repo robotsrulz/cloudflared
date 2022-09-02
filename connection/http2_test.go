@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gobwas/ws/wsutil"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +33,7 @@ func newTestHTTP2Connection() (*HTTP2Connection, net.Conn) {
 	edgeConn, cfdConn := net.Pipe()
 	var connIndex = uint8(0)
 	log := zerolog.Nop()
-	obs := NewObserver(&log, &log, false)
+	obs := NewObserver(&log, &log)
 	controlStream := NewControlStream(
 		obs,
 		mockConnectedFuse{},
@@ -40,7 +41,9 @@ func newTestHTTP2Connection() (*HTTP2Connection, net.Conn) {
 		connIndex,
 		nil,
 		nil,
+		nil,
 		1*time.Second,
+		HTTP2,
 	)
 	return NewHTTP2Connection(
 		cfdConn,
@@ -166,18 +169,27 @@ type mockNamedTunnelRPCClient struct {
 	unregistered chan struct{}
 }
 
+func (mc mockNamedTunnelRPCClient) SendLocalConfiguration(c context.Context, config []byte, observer *Observer) error {
+	return nil
+}
+
 func (mc mockNamedTunnelRPCClient) RegisterConnection(
 	c context.Context,
 	properties *NamedTunnelProperties,
 	options *tunnelpogs.ConnectionOptions,
 	connIndex uint8,
+	edgeAddress net.IP,
 	observer *Observer,
-) error {
+) (*tunnelpogs.ConnectionDetails, error) {
 	if mc.shouldFail != nil {
-		return mc.shouldFail
+		return nil, mc.shouldFail
 	}
 	close(mc.registered)
-	return nil
+	return &tunnelpogs.ConnectionDetails{
+		Location:                "LIS",
+		UUID:                    uuid.New(),
+		TunnelIsRemotelyManaged: false,
+	}, nil
 }
 
 func (mc mockNamedTunnelRPCClient) GracefulShutdown(ctx context.Context, gracePeriod time.Duration) {
@@ -345,15 +357,17 @@ func TestServeControlStream(t *testing.T) {
 		unregistered: make(chan struct{}),
 	}
 
-	obs := NewObserver(&log, &log, false)
+	obs := NewObserver(&log, &log)
 	controlStream := NewControlStream(
 		obs,
 		mockConnectedFuse{},
 		&NamedTunnelProperties{},
 		1,
+		nil,
 		rpcClientFactory.newMockRPCClient,
 		nil,
 		1*time.Second,
+		HTTP2,
 	)
 	http2Conn.controlStreamHandler = controlStream
 
@@ -395,15 +409,17 @@ func TestFailRegistration(t *testing.T) {
 		unregistered: make(chan struct{}),
 	}
 
-	obs := NewObserver(&log, &log, false)
+	obs := NewObserver(&log, &log)
 	controlStream := NewControlStream(
 		obs,
 		mockConnectedFuse{},
 		&NamedTunnelProperties{},
 		http2Conn.connIndex,
+		nil,
 		rpcClientFactory.newMockRPCClient,
 		nil,
 		1*time.Second,
+		HTTP2,
 	)
 	http2Conn.controlStreamHandler = controlStream
 
@@ -440,16 +456,18 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 	events := &eventCollectorSink{}
 
 	shutdownC := make(chan struct{})
-	obs := NewObserver(&log, &log, false)
+	obs := NewObserver(&log, &log)
 	obs.RegisterSink(events)
 	controlStream := NewControlStream(
 		obs,
 		mockConnectedFuse{},
 		&NamedTunnelProperties{},
 		http2Conn.connIndex,
+		nil,
 		rpcClientFactory.newMockRPCClient,
 		shutdownC,
 		1*time.Second,
+		HTTP2,
 	)
 
 	http2Conn.controlStreamHandler = controlStream
@@ -477,7 +495,7 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 
 	select {
 	case <-rpcClientFactory.registered:
-		break //ok
+		break // ok
 	case <-time.Tick(time.Second):
 		t.Fatal("timeout out waiting for registration")
 	}
@@ -487,7 +505,7 @@ func TestGracefulShutdownHTTP2(t *testing.T) {
 
 	select {
 	case <-rpcClientFactory.unregistered:
-		break //ok
+		break // ok
 	case <-time.Tick(time.Second):
 		t.Fatal("timeout out waiting for unregistered signal")
 	}

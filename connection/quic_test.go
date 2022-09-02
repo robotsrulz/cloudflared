@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,10 +32,13 @@ import (
 var (
 	testTLSServerConfig = quicpogs.GenerateTLSConfig()
 	testQUICConfig      = &quic.Config{
-		KeepAlive:       true,
-		EnableDatagrams: true,
+		ConnectionIDLength: 16,
+		KeepAlivePeriod:    5 * time.Second,
+		EnableDatagrams:    true,
 	}
 )
+
+var _ ReadWriteAcker = (*streamReadWriteAcker)(nil)
 
 // TestQUICServer tests if a quic server accepts and responds to a quic client with the acceptance protocol.
 // It also serves as a demonstration for communication with the QUIC connection started by a cloudflared.
@@ -163,7 +167,7 @@ type fakeControlStream struct {
 	ControlStreamHandler
 }
 
-func (fakeControlStream) ServeControlStream(ctx context.Context, rw io.ReadWriteCloser, connOptions *tunnelpogs.ConnectionOptions) error {
+func (fakeControlStream) ServeControlStream(ctx context.Context, rw io.ReadWriteCloser, connOptions *tunnelpogs.ConnectionOptions, tunnelConfigGetter TunnelConfigJSONGetter) error {
 	<-ctx.Done()
 	return nil
 }
@@ -220,7 +224,7 @@ func quicServer(
 
 type mockOriginProxyWithRequest struct{}
 
-func (moc *mockOriginProxyWithRequest) ProxyHTTP(w ResponseWriter, tr *tracing.TracedRequest, isWebsocket bool) error {
+func (moc *mockOriginProxyWithRequest) ProxyHTTP(w ResponseWriter, tr *tracing.TracedHTTPRequest, isWebsocket bool) error {
 	// These are a series of crude tests to ensure the headers and http related data is transferred from
 	// metadata.
 	r := tr.Request
@@ -475,9 +479,10 @@ func TestBuildHTTPRequest(t *testing.T) {
 		},
 	}
 
+	log := zerolog.Nop()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			req, err := buildHTTPRequest(test.connectRequest, test.body)
+			req, err := buildHTTPRequest(context.Background(), test.connectRequest, test.body, &log)
 			assert.NoError(t, err)
 			test.req = test.req.WithContext(req.Context())
 			assert.Equal(t, test.req, req.Request)
@@ -486,7 +491,7 @@ func TestBuildHTTPRequest(t *testing.T) {
 }
 
 func (moc *mockOriginProxyWithRequest) ProxyTCP(ctx context.Context, rwa ReadWriteAcker, tcpRequest *TCPRequest) error {
-	rwa.AckConnection()
+	rwa.AckConnection("")
 	io.Copy(rwa, rwa)
 	return nil
 }
@@ -500,9 +505,10 @@ func TestServeUDPSession(t *testing.T) {
 	defer udpListener.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	val := udpListener.LocalAddr()
 
 	// Establish QUIC connection with edge
-	edgeQUICSessionChan := make(chan quic.Session)
+	edgeQUICSessionChan := make(chan quic.Connection)
 	go func() {
 		earlyListener, err := quic.Listen(udpListener, testTLSServerConfig, testQUICConfig)
 		require.NoError(t, err)
@@ -512,7 +518,7 @@ func TestServeUDPSession(t *testing.T) {
 		edgeQUICSessionChan <- edgeQUICSession
 	}()
 
-	qc := testQUICConnection(udpListener.LocalAddr(), t)
+	qc := testQUICConnection(val, t)
 	go qc.Serve(ctx)
 
 	edgeQUICSession := <-edgeQUICSessionChan
@@ -522,7 +528,45 @@ func TestServeUDPSession(t *testing.T) {
 	cancel()
 }
 
-func serveSession(ctx context.Context, qc *QUICConnection, edgeQUICSession quic.Session, closeType closeReason, expectedReason string, t *testing.T) {
+func TestNopCloserReadWriterCloseBeforeEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{ReadWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 5)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, n, 5)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get error
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, n, 0)
+	require.Equal(t, err, fmt.Errorf("closed by handler"))
+}
+
+func TestNopCloserReadWriterCloseAfterEOF(t *testing.T) {
+	readerWriter := nopCloserReadWriter{ReadWriteCloser: &mockReaderNoopWriter{Reader: strings.NewReader("123456789")}}
+	buffer := make([]byte, 20)
+
+	n, err := readerWriter.Read(buffer)
+	require.NoError(t, err)
+	require.Equal(t, n, 9)
+
+	// force another read to read eof
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, err, io.EOF)
+
+	// close
+	require.NoError(t, readerWriter.Close())
+
+	// read should get EOF still
+	n, err = readerWriter.Read(buffer)
+	require.Equal(t, n, 0)
+	require.Equal(t, err, io.EOF)
+}
+
+func serveSession(ctx context.Context, qc *QUICConnection, edgeQUICSession quic.Connection, closeType closeReason, expectedReason string, t *testing.T) {
 	var (
 		payload = []byte(t.Name())
 	)
@@ -583,7 +627,7 @@ const (
 	closedByTimeout
 )
 
-func runRPCServer(ctx context.Context, session quic.Session, sessionRPCServer tunnelpogs.SessionManager, configRPCServer tunnelpogs.ConfigurationManager, t *testing.T) {
+func runRPCServer(ctx context.Context, session quic.Connection, sessionRPCServer tunnelpogs.SessionManager, configRPCServer tunnelpogs.ConfigurationManager, t *testing.T) {
 	stream, err := session.AcceptStream(ctx)
 	require.NoError(t, err)
 
@@ -638,7 +682,20 @@ func testQUICConnection(udpListenerAddr net.Addr, t *testing.T) *QUICConnection 
 		&tunnelpogs.ConnectionOptions{},
 		fakeControlStream{},
 		&log,
+		nil,
 	)
 	require.NoError(t, err)
 	return qc
+}
+
+type mockReaderNoopWriter struct {
+	io.Reader
+}
+
+func (m *mockReaderNoopWriter) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (m *mockReaderNoopWriter) Close() error {
+	return nil
 }

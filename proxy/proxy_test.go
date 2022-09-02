@@ -22,6 +22,8 @@ import (
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/cloudflare/cloudflared/cfio"
+
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/hello"
@@ -32,7 +34,12 @@ import (
 )
 
 var (
-	testTags = []tunnelpogs.Tag{tunnelpogs.Tag{Name: "Name", Value: "value"}}
+	testTags        = []tunnelpogs.Tag{tunnelpogs.Tag{Name: "Name", Value: "value"}}
+	noWarpRouting   = ingress.WarpRoutingConfig{}
+	testWarpRouting = ingress.WarpRoutingConfig{
+		Enabled:        true,
+		ConnectTimeout: config.CustomDuration{Duration: time.Second},
+	}
 )
 
 type mockHTTPRespWriter struct {
@@ -55,6 +62,10 @@ func (w *mockHTTPRespWriter) WriteRespHeaders(status int, header http.Header) er
 		w.Header()[header] = val
 	}
 	return nil
+}
+
+func (w *mockHTTPRespWriter) AddTrailer(trailerName, trailerValue string) {
+	// do nothing
 }
 
 func (w *mockHTTPRespWriter) Read(data []byte) (int, error) {
@@ -112,8 +123,15 @@ func newMockSSERespWriter() *mockSSERespWriter {
 }
 
 func (w *mockSSERespWriter) Write(data []byte) (int, error) {
-	w.writeNotification <- data
+	newData := make([]byte, len(data))
+	copy(newData, data)
+
+	w.writeNotification <- newData
 	return len(data), nil
+}
+
+func (w *mockSSERespWriter) WriteString(str string) (int, error) {
+	return w.Write([]byte(str))
 }
 
 func (w *mockSSERespWriter) ReadBytes() []byte {
@@ -138,11 +156,10 @@ func TestProxySingleOrigin(t *testing.T) {
 
 	require.NoError(t, ingressRule.StartOrigins(&log, ctx.Done()))
 
-	proxy := NewOriginProxy(ingressRule, false, testTags, &log)
+	proxy := NewOriginProxy(ingressRule, noWarpRouting, testTags, &log)
 	t.Run("testProxyHTTP", testProxyHTTP(proxy))
 	t.Run("testProxyWebsocket", testProxyWebsocket(proxy))
 	t.Run("testProxySSE", testProxySSE(proxy))
-	t.Run("testProxySSEAllData", testProxySSEAllData(proxy))
 	cancel()
 }
 
@@ -152,7 +169,8 @@ func testProxyHTTP(proxy connection.OriginProxy) func(t *testing.T) {
 		req, err := http.NewRequest(http.MethodGet, "http://localhost:8080", nil)
 		require.NoError(t, err)
 
-		err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedRequest(req), false)
+		log := zerolog.Nop()
+		err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedHTTPRequest(req, &log), false)
 		require.NoError(t, err)
 		for _, tag := range testTags {
 			assert.Equal(t, tag.Value, req.Header.Get(TagHeaderNamePrefix+tag.Name))
@@ -179,7 +197,8 @@ func testProxyWebsocket(proxy connection.OriginProxy) func(t *testing.T) {
 
 		errGroup, ctx := errgroup.WithContext(ctx)
 		errGroup.Go(func() error {
-			err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedRequest(req), true)
+			log := zerolog.Nop()
+			err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedHTTPRequest(req, &log), true)
 			require.NoError(t, err)
 
 			require.Equal(t, http.StatusSwitchingProtocols, responseWriter.Code)
@@ -240,7 +259,8 @@ func testProxySSE(proxy connection.OriginProxy) func(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedRequest(req), false)
+			log := zerolog.Nop()
+			err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedHTTPRequest(req, &log), false)
 			require.NoError(t, err)
 
 			require.Equal(t, http.StatusOK, responseWriter.Code)
@@ -248,11 +268,8 @@ func testProxySSE(proxy connection.OriginProxy) func(t *testing.T) {
 
 		for i := 0; i < pushCount; i++ {
 			line := responseWriter.ReadBytes()
-			expect := fmt.Sprintf("%d\n", i)
+			expect := fmt.Sprintf("%d\n\n", i)
 			require.Equal(t, []byte(expect), line, fmt.Sprintf("Expect to read %v, got %v", expect, line))
-
-			line = responseWriter.ReadBytes()
-			require.Equal(t, []byte("\n"), line, fmt.Sprintf("Expect to read '\n', got %v", line))
 		}
 
 		cancel()
@@ -262,17 +279,15 @@ func testProxySSE(proxy connection.OriginProxy) func(t *testing.T) {
 
 // Regression test to guarantee that we always write the contents downstream even if EOF is reached without
 // hitting the delimiter
-func testProxySSEAllData(proxy *Proxy) func(t *testing.T) {
-	return func(t *testing.T) {
-		eyeballReader := io.NopCloser(strings.NewReader("data\r\r"))
-		responseWriter := newMockSSERespWriter()
+func TestProxySSEAllData(t *testing.T) {
+	eyeballReader := io.NopCloser(strings.NewReader("data\r\r"))
+	responseWriter := newMockSSERespWriter()
 
-		// responseWriter uses an unbuffered channel, so we call in a different go-routine
-		go proxy.writeEventStream(responseWriter, eyeballReader)
+	// responseWriter uses an unbuffered channel, so we call in a different go-routine
+	go cfio.Copy(responseWriter, eyeballReader)
 
-		result := string(<-responseWriter.writeNotification)
-		require.Equal(t, "data\r\r", result)
-	}
+	result := string(<-responseWriter.writeNotification)
+	require.Equal(t, "data\r\r", result)
 }
 
 func TestProxyMultipleOrigins(t *testing.T) {
@@ -345,14 +360,14 @@ func runIngressTestScenarios(t *testing.T, unvalidatedIngress []config.Unvalidat
 	ctx, cancel := context.WithCancel(context.Background())
 	require.NoError(t, ingress.StartOrigins(&log, ctx.Done()))
 
-	proxy := NewOriginProxy(ingress, false, testTags, &log)
+	proxy := NewOriginProxy(ingress, noWarpRouting, testTags, &log)
 
 	for _, test := range tests {
 		responseWriter := newMockHTTPRespWriter()
 		req, err := http.NewRequest(http.MethodGet, test.url, nil)
 		require.NoError(t, err)
 
-		err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedRequest(req), false)
+		err = proxy.ProxyHTTP(responseWriter, tracing.NewTracedHTTPRequest(req, &log), false)
 		require.NoError(t, err)
 
 		assert.Equal(t, test.expectedStatus, responseWriter.Code)
@@ -393,13 +408,13 @@ func TestProxyError(t *testing.T) {
 
 	log := zerolog.Nop()
 
-	proxy := NewOriginProxy(ing, false, testTags, &log)
+	proxy := NewOriginProxy(ing, noWarpRouting, testTags, &log)
 
 	responseWriter := newMockHTTPRespWriter()
 	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1", nil)
 	assert.NoError(t, err)
 
-	assert.Error(t, proxy.ProxyHTTP(responseWriter, tracing.NewTracedRequest(req), false))
+	assert.Error(t, proxy.ProxyHTTP(responseWriter, tracing.NewTracedHTTPRequest(req, &log), false))
 }
 
 type replayer struct {
@@ -509,7 +524,7 @@ func TestConnections(t *testing.T) {
 				originService:         runEchoTCPService,
 				eyeballResponseWriter: newTCPRespWriter(replayer),
 				eyeballRequestBody:    newTCPRequestBody([]byte("test2")),
-				warpRoutingService:    ingress.NewWarpRoutingService(),
+				warpRoutingService:    ingress.NewWarpRoutingService(testWarpRouting),
 				connectionType:        connection.TypeTCP,
 				requestHeaders: map[string][]string{
 					"Cf-Cloudflared-Proxy-Src": {"non-blank-value"},
@@ -517,6 +532,7 @@ func TestConnections(t *testing.T) {
 			},
 			want: want{
 				message: []byte("echo-test2"),
+				headers: http.Header{},
 			},
 		},
 		{
@@ -526,7 +542,7 @@ func TestConnections(t *testing.T) {
 				originService:        runEchoWSService,
 				// eyeballResponseWriter gets set after roundtrip dial.
 				eyeballRequestBody: newPipedWSRequestBody([]byte("test3")),
-				warpRoutingService: ingress.NewWarpRoutingService(),
+				warpRoutingService: ingress.NewWarpRoutingService(testWarpRouting),
 				requestHeaders: map[string][]string{
 					"Cf-Cloudflared-Proxy-Src": {"non-blank-value"},
 				},
@@ -536,6 +552,7 @@ func TestConnections(t *testing.T) {
 				message: []byte("echo-test3"),
 				// We expect no headers here because they are sent back via
 				// the stream.
+				headers: http.Header{},
 			},
 		},
 		{
@@ -652,7 +669,7 @@ func TestConnections(t *testing.T) {
 
 			ingressRule := createSingleIngressConfig(t, test.args.ingressServiceScheme+ln.Addr().String())
 			ingressRule.StartOrigins(logger, ctx.Done())
-			proxy := NewOriginProxy(ingressRule, true, testTags, logger)
+			proxy := NewOriginProxy(ingressRule, testWarpRouting, testTags, logger)
 			proxy.warpRouting = test.args.warpRoutingService
 
 			dest := ln.Addr().String()
@@ -677,7 +694,8 @@ func TestConnections(t *testing.T) {
 				rwa := connection.NewHTTPResponseReadWriterAcker(respWriter, req)
 				err = proxy.ProxyTCP(ctx, rwa, &connection.TCPRequest{Dest: dest})
 			} else {
-				err = proxy.ProxyHTTP(respWriter, tracing.NewTracedRequest(req), test.args.connectionType == connection.TypeWebsocket)
+				log := zerolog.Nop()
+				err = proxy.ProxyHTTP(respWriter, tracing.NewTracedHTTPRequest(req, &log), test.args.connectionType == connection.TypeWebsocket)
 			}
 
 			cancel()
@@ -814,6 +832,10 @@ func (w *wsRespWriter) WriteRespHeaders(status int, header http.Header) error {
 	return nil
 }
 
+func (w *wsRespWriter) AddTrailer(trailerName, trailerValue string) {
+	// do nothing
+}
+
 // respHeaders is a test function to read respHeaders
 func (w *wsRespWriter) headers() http.Header {
 	// Removing indeterminstic header because it cannot be asserted.
@@ -839,6 +861,10 @@ func (m *mockTCPRespWriter) Read(p []byte) (n int, err error) {
 
 func (m *mockTCPRespWriter) Write(p []byte) (n int, err error) {
 	return m.w.Write(p)
+}
+
+func (w *mockTCPRespWriter) AddTrailer(trailerName, trailerValue string) {
+	// do nothing
 }
 
 func (m *mockTCPRespWriter) WriteRespHeaders(status int, header http.Header) error {

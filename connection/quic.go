@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/datagramsession"
 	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/packet"
 	quicpogs "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/tracing"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
@@ -31,14 +33,22 @@ const (
 	HTTPMethodKey = "HttpMethod"
 	// HTTPHostKey is used to get or set http Method in QUIC ALPN if the underlying proxy connection type is HTTP.
 	HTTPHostKey = "HttpHost"
+
+	QUICMetadataFlowID = "FlowID"
+	// emperically this capacity has been working well
+	demuxChanCapacity = 16
 )
 
 // QUICConnection represents the type that facilitates Proxying via QUIC streams.
 type QUICConnection struct {
-	session              quic.Session
-	logger               *zerolog.Logger
-	orchestrator         Orchestrator
-	sessionManager       datagramsession.Manager
+	session      quic.Connection
+	logger       *zerolog.Logger
+	orchestrator Orchestrator
+	// sessionManager tracks active sessions. It receives datagrams from quic connection via datagramMuxer
+	sessionManager datagramsession.Manager
+	// datagramMuxer mux/demux datagrams from quic connection
+	datagramMuxer        quicpogs.BaseDatagramMuxer
+	packetRouter         *packetRouter
 	controlStreamHandler ControlStreamHandler
 	connOptions          *tunnelpogs.ConnectionOptions
 }
@@ -52,24 +62,37 @@ func NewQUICConnection(
 	connOptions *tunnelpogs.ConnectionOptions,
 	controlStreamHandler ControlStreamHandler,
 	logger *zerolog.Logger,
+	icmpProxy ingress.ICMPProxy,
 ) (*QUICConnection, error) {
 	session, err := quic.DialAddr(edgeAddr.String(), tlsConfig, quicConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial to edge: %w", err)
+		return nil, &EdgeQuicDialError{Cause: err}
 	}
 
-	datagramMuxer, err := quicpogs.NewDatagramMuxer(session)
-	if err != nil {
-		return nil, err
+	sessionDemuxChan := make(chan *packet.Session, demuxChanCapacity)
+	var (
+		datagramMuxer quicpogs.BaseDatagramMuxer
+		pr            *packetRouter
+	)
+	if icmpProxy != nil {
+		pr = &packetRouter{
+			muxer:     quicpogs.NewDatagramMuxerV2(session, logger, sessionDemuxChan),
+			icmpProxy: icmpProxy,
+			logger:    logger,
+		}
+		datagramMuxer = pr.muxer
+	} else {
+		datagramMuxer = quicpogs.NewDatagramMuxer(session, logger, sessionDemuxChan)
 	}
-
-	sessionManager := datagramsession.NewManager(datagramMuxer, logger)
+	sessionManager := datagramsession.NewManager(logger, datagramMuxer.SendToSession, sessionDemuxChan)
 
 	return &QUICConnection{
 		session:              session,
 		orchestrator:         orchestrator,
 		logger:               logger,
 		sessionManager:       sessionManager,
+		datagramMuxer:        datagramMuxer,
+		packetRouter:         pr,
 		controlStreamHandler: controlStreamHandler,
 		connOptions:          connOptions,
 	}, nil
@@ -106,18 +129,34 @@ func (q *QUICConnection) Serve(ctx context.Context) error {
 		return q.sessionManager.Serve(ctx)
 	})
 
+	errGroup.Go(func() error {
+		defer cancel()
+		return q.datagramMuxer.ServeReceive(ctx)
+	})
+	if q.packetRouter != nil {
+		errGroup.Go(func() error {
+			defer cancel()
+			return q.packetRouter.serve(ctx)
+		})
+	}
+
 	return errGroup.Wait()
 }
 
 func (q *QUICConnection) serveControlStream(ctx context.Context, controlStream quic.Stream) error {
 	// This blocks until the control plane is done.
-	err := q.controlStreamHandler.ServeControlStream(ctx, controlStream, q.connOptions)
+	err := q.controlStreamHandler.ServeControlStream(ctx, controlStream, q.connOptions, q.orchestrator)
 	if err != nil {
 		// Not wrapping error here to be consistent with the http2 message.
 		return err
 	}
 
 	return nil
+}
+
+// Close closes the session with no errors specified.
+func (q *QUICConnection) Close() {
+	q.session.CloseWithError(0, "")
 }
 
 func (q *QUICConnection) acceptStream(ctx context.Context) error {
@@ -131,23 +170,26 @@ func (q *QUICConnection) acceptStream(ctx context.Context) error {
 			}
 			return fmt.Errorf("failed to accept QUIC stream: %w", err)
 		}
-		go func() {
-			stream := quicpogs.NewSafeStreamCloser(quicStream)
-			defer stream.Close()
-
-			if err = q.handleStream(stream); err != nil {
-				q.logger.Err(err).Msg("Failed to handle QUIC stream")
-			}
-		}()
+		go q.runStream(quicStream)
 	}
 }
 
-// Close closes the session with no errors specified.
-func (q *QUICConnection) Close() {
-	q.session.CloseWithError(0, "")
+func (q *QUICConnection) runStream(quicStream quic.Stream) {
+	ctx := quicStream.Context()
+	stream := quicpogs.NewSafeStreamCloser(quicStream)
+	defer stream.Close()
+
+	// we are going to fuse readers/writers from stream <- cloudflared -> origin, and we want to guarantee that
+	// code executed in the code path of handleStream don't trigger an earlier close to the downstream write stream.
+	// So, we wrap the stream with a no-op write closer and only this method can actually close write side of the stream.
+	// A call to close will simulate a close to the read-side, which will fail subsequent reads.
+	noCloseStream := &nopCloserReadWriter{ReadWriteCloser: stream}
+	if err := q.handleStream(ctx, noCloseStream); err != nil {
+		q.logger.Err(err).Msg("Failed to handle QUIC stream")
+	}
 }
 
-func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
+func (q *QUICConnection) handleStream(ctx context.Context, stream io.ReadWriteCloser) error {
 	signature, err := quicpogs.DetermineProtocol(stream)
 	if err != nil {
 		return err
@@ -156,9 +198,9 @@ func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
 	case quicpogs.DataStreamProtocolSignature:
 		reqServerStream, err := quicpogs.NewRequestServerStream(stream, signature)
 		if err != nil {
-			return nil
+			return err
 		}
-		return q.handleDataStream(reqServerStream)
+		return q.handleDataStream(ctx, reqServerStream)
 	case quicpogs.RPCStreamProtocolSignature:
 		rpcStream, err := quicpogs.NewRPCServerStream(stream, signature)
 		if err != nil {
@@ -170,28 +212,43 @@ func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
 	}
 }
 
-func (q *QUICConnection) handleDataStream(stream *quicpogs.RequestServerStream) error {
-	connectRequest, err := stream.ReadConnectRequestData()
+func (q *QUICConnection) handleDataStream(ctx context.Context, stream *quicpogs.RequestServerStream) error {
+	request, err := stream.ReadConnectRequestData()
 	if err != nil {
 		return err
 	}
 
+	if err := q.dispatchRequest(ctx, stream, err, request); err != nil {
+		_ = stream.WriteConnectResponseData(err)
+		q.logger.Err(err).Str("type", request.Type.String()).Str("dest", request.Dest).Msg("Request failed")
+	}
+
+	return nil
+}
+
+func (q *QUICConnection) dispatchRequest(ctx context.Context, stream *quicpogs.RequestServerStream, err error, request *quicpogs.ConnectRequest) error {
 	originProxy, err := q.orchestrator.GetOriginProxy()
 	if err != nil {
 		return err
 	}
-	switch connectRequest.Type {
+
+	switch request.Type {
 	case quicpogs.ConnectionTypeHTTP, quicpogs.ConnectionTypeWebsocket:
-		tracedReq, err := buildHTTPRequest(connectRequest, stream)
+		tracedReq, err := buildHTTPRequest(ctx, request, stream, q.logger)
 		if err != nil {
 			return err
 		}
-
 		w := newHTTPResponseAdapter(stream)
-		return originProxy.ProxyHTTP(w, tracedReq, connectRequest.Type == quicpogs.ConnectionTypeWebsocket)
+		return originProxy.ProxyHTTP(w, tracedReq, request.Type == quicpogs.ConnectionTypeWebsocket)
+
 	case quicpogs.ConnectionTypeTCP:
 		rwa := &streamReadWriteAcker{stream}
-		return originProxy.ProxyTCP(context.Background(), rwa, &TCPRequest{Dest: connectRequest.Dest})
+		metadata := request.MetadataMap()
+		return originProxy.ProxyTCP(ctx, rwa, &TCPRequest{
+			Dest:      request.Dest,
+			FlowID:    metadata[QUICMetadataFlowID],
+			CfTraceID: metadata[tracing.TracerContextName],
+		})
 	}
 	return nil
 }
@@ -217,7 +274,7 @@ func (q *QUICConnection) RegisterUdpSession(ctx context.Context, sessionID uuid.
 
 	go q.serveUDPSession(session, closeAfterIdleHint)
 
-	q.logger.Debug().Msgf("Registered session %v, %v, %v", sessionID, dstIP, dstPort)
+	q.logger.Debug().Str("sessionID", sessionID.String()).Str("src", originProxy.LocalAddr().String()).Str("dst", fmt.Sprintf("%s:%d", dstIP, dstPort)).Msgf("Registered session")
 	return nil
 }
 
@@ -270,6 +327,32 @@ func (q *QUICConnection) UpdateConfiguration(ctx context.Context, version int32,
 	return q.orchestrator.UpdateConfig(version, config)
 }
 
+type packetRouter struct {
+	muxer     *quicpogs.DatagramMuxerV2
+	icmpProxy ingress.ICMPProxy
+	logger    *zerolog.Logger
+}
+
+func (pr *packetRouter) serve(ctx context.Context) error {
+	icmpDecoder := packet.NewICMPDecoder()
+	for {
+		pk, err := pr.muxer.ReceivePacket(ctx)
+		if err != nil {
+			return err
+		}
+		icmpPacket, err := icmpDecoder.Decode(pk)
+		if err != nil {
+			pr.logger.Err(err).Msg("Failed to decode ICMP packet from quic datagram")
+			continue
+		}
+
+		if err := pr.icmpProxy.Request(icmpPacket, pr.muxer); err != nil {
+			pr.logger.Err(err).Str("src", icmpPacket.Src.String()).Str("dst", icmpPacket.Dst.String()).Msg("Failed to send ICMP packet")
+			continue
+		}
+	}
+}
+
 // streamReadWriteAcker is a light wrapper over QUIC streams with a callback to send response back to
 // the client.
 type streamReadWriteAcker struct {
@@ -277,8 +360,12 @@ type streamReadWriteAcker struct {
 }
 
 // AckConnection acks response back to the proxy.
-func (s *streamReadWriteAcker) AckConnection() error {
-	return s.WriteConnectResponseData(nil)
+func (s *streamReadWriteAcker) AckConnection(tracePropagation string) error {
+	metadata := quicpogs.Metadata{
+		Key: tracing.CanonicalCloudflaredTracingHeader,
+		Val: tracePropagation,
+	}
+	return s.WriteConnectResponseData(nil, metadata)
 }
 
 // httpResponseAdapter translates responses written by the HTTP Proxy into ones that can be used in QUIC.
@@ -288,6 +375,10 @@ type httpResponseAdapter struct {
 
 func newHTTPResponseAdapter(s *quicpogs.RequestServerStream) httpResponseAdapter {
 	return httpResponseAdapter{s}
+}
+
+func (hrw httpResponseAdapter) AddTrailer(trailerName, trailerValue string) {
+	// we do not support trailers over QUIC
 }
 
 func (hrw httpResponseAdapter) WriteRespHeaders(status int, header http.Header) error {
@@ -306,14 +397,19 @@ func (hrw httpResponseAdapter) WriteErrorResponse(err error) {
 	hrw.WriteConnectResponseData(err, quicpogs.Metadata{Key: "HttpStatus", Val: strconv.Itoa(http.StatusBadGateway)})
 }
 
-func buildHTTPRequest(connectRequest *quicpogs.ConnectRequest, body io.ReadCloser) (*tracing.TracedRequest, error) {
+func buildHTTPRequest(
+	ctx context.Context,
+	connectRequest *quicpogs.ConnectRequest,
+	body io.ReadCloser,
+	log *zerolog.Logger,
+) (*tracing.TracedHTTPRequest, error) {
 	metadata := connectRequest.MetadataMap()
 	dest := connectRequest.Dest
 	method := metadata[HTTPMethodKey]
 	host := metadata[HTTPHostKey]
 	isWebsocket := connectRequest.Type == quicpogs.ConnectionTypeWebsocket
 
-	req, err := http.NewRequest(method, dest, body)
+	req, err := http.NewRequestWithContext(ctx, method, dest, body)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +444,7 @@ func buildHTTPRequest(connectRequest *quicpogs.ConnectRequest, body io.ReadClose
 	stripWebsocketUpgradeHeader(req)
 
 	// Check for tracing on request
-	tracedReq := tracing.NewTracedRequest(req)
+	tracedReq := tracing.NewTracedHTTPRequest(req, log)
 	return tracedReq, err
 }
 
@@ -365,4 +461,41 @@ func isTransferEncodingChunked(req *http.Request) bool {
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding suggests that this can be a comma
 	// separated value as well.
 	return strings.Contains(strings.ToLower(transferEncodingVal), "chunked")
+}
+
+// A helper struct that guarantees a call to close only affects read side, but not write side.
+type nopCloserReadWriter struct {
+	io.ReadWriteCloser
+
+	// for use by Read only
+	// we don't need a memory barrier here because there is an implicit assumption that
+	// Read calls can't happen concurrently by different go-routines.
+	sawEOF bool
+	// should be updated and read using atomic primitives.
+	// value is read in Read method and written in Close method, which could be done by different
+	// go-routines.
+	closed uint32
+}
+
+func (np *nopCloserReadWriter) Read(p []byte) (n int, err error) {
+	if np.sawEOF {
+		return 0, io.EOF
+	}
+
+	if atomic.LoadUint32(&np.closed) > 0 {
+		return 0, fmt.Errorf("closed by handler")
+	}
+
+	n, err = np.ReadWriteCloser.Read(p)
+	if err == io.EOF {
+		np.sawEOF = true
+	}
+
+	return
+}
+
+func (np *nopCloserReadWriter) Close() error {
+	atomic.StoreUint32(&np.closed, 1)
+
+	return nil
 }

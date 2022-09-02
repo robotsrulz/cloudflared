@@ -3,9 +3,15 @@ package tracing
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
+	"os"
+	"runtime"
+	"strings"
 
-	otelContrib "go.opentelemetry.io/contrib/propagators/Jaeger"
+	"github.com/rs/zerolog"
+	otelContrib "go.opentelemetry.io/contrib/propagators/jaeger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -21,16 +27,32 @@ const (
 	service              = "cloudflared"
 	tracerInstrumentName = "origin"
 
-	tracerContextName         = "cf-trace-id"
-	tracerContextNameOverride = "uber-trace-id"
+	TracerContextName         = "cf-trace-id"
+	TracerContextNameOverride = "uber-trace-id"
+
+	IntCloudflaredTracingHeader = "cf-int-cloudflared-tracing"
+
+	MaxErrorDescriptionLen = 100
+	traceHttpStatusCodeKey = "upstreamStatusCode"
+
+	traceID128bitsWidth = 128 / 4
+	separator           = ":"
 )
 
 var (
-	Http2TransportAttribute = trace.WithAttributes(TransportAttributeKey.String("http2"))
-	QuicTransportAttribute  = trace.WithAttributes(TransportAttributeKey.String("quic"))
+	CanonicalCloudflaredTracingHeader = http.CanonicalHeaderKey(IntCloudflaredTracingHeader)
+	Http2TransportAttribute           = trace.WithAttributes(transportAttributeKey.String("http2"))
+	QuicTransportAttribute            = trace.WithAttributes(transportAttributeKey.String("quic"))
+	HostOSAttribute                   = semconv.HostTypeKey.String(runtime.GOOS)
+	HostArchAttribute                 = semconv.HostArchKey.String(runtime.GOARCH)
 
-	TransportAttributeKey = attribute.Key("transport")
-	TrafficAttributeKey   = attribute.Key("traffic")
+	otelVersionAttribute        attribute.KeyValue
+	hostnameAttribute           attribute.KeyValue
+	cloudflaredVersionAttribute attribute.KeyValue
+	serviceAttribute            = semconv.ServiceNameKey.String(service)
+
+	transportAttributeKey   = attribute.Key("transport")
+	otelVersionAttributeKey = attribute.Key("jaeger.version")
 
 	errNoopTracerProvider = errors.New("noop tracer provider records no spans")
 )
@@ -38,24 +60,60 @@ var (
 func init() {
 	// Register the jaeger propagator globally.
 	otel.SetTextMapPropagator(otelContrib.Jaeger{})
+	otelVersionAttribute = otelVersionAttributeKey.String(fmt.Sprintf("go-otel-%s", otel.Version()))
+	if hostname, err := os.Hostname(); err == nil {
+		hostnameAttribute = attribute.String("hostname", hostname)
+	}
 }
 
-type TracedRequest struct {
+func Init(version string) {
+	cloudflaredVersionAttribute = semconv.ProcessRuntimeVersionKey.String(version)
+}
+
+type TracedHTTPRequest struct {
 	*http.Request
-	trace.TracerProvider
-	exporter InMemoryClient
+	*cfdTracer
 }
 
-// NewTracedRequest creates a new tracer for the current request context.
-func NewTracedRequest(req *http.Request) *TracedRequest {
+// NewTracedHTTPRequest creates a new tracer for the current HTTP request context.
+func NewTracedHTTPRequest(req *http.Request, log *zerolog.Logger) *TracedHTTPRequest {
 	ctx, exists := extractTrace(req)
 	if !exists {
-		return &TracedRequest{req, trace.NewNoopTracerProvider(), &NoopOtlpClient{}}
+		return &TracedHTTPRequest{req, &cfdTracer{trace.NewNoopTracerProvider(), &NoopOtlpClient{}, log}}
 	}
+	return &TracedHTTPRequest{req.WithContext(ctx), newCfdTracer(ctx, log)}
+}
+
+func (tr *TracedHTTPRequest) ToTracedContext() *TracedContext {
+	return &TracedContext{tr.Context(), tr.cfdTracer}
+}
+
+type TracedContext struct {
+	context.Context
+	*cfdTracer
+}
+
+// NewTracedHTTPRequest creates a new tracer for the current HTTP request context.
+func NewTracedContext(ctx context.Context, traceContext string, log *zerolog.Logger) *TracedContext {
+	ctx, exists := extractTraceFromString(ctx, traceContext)
+	if !exists {
+		return &TracedContext{ctx, &cfdTracer{trace.NewNoopTracerProvider(), &NoopOtlpClient{}, log}}
+	}
+	return &TracedContext{ctx, newCfdTracer(ctx, log)}
+}
+
+type cfdTracer struct {
+	trace.TracerProvider
+	exporter InMemoryClient
+	log      *zerolog.Logger
+}
+
+// NewCfdTracer creates a new tracer for the current request context.
+func newCfdTracer(ctx context.Context, log *zerolog.Logger) *cfdTracer {
 	mc := new(InMemoryOtlpClient)
-	exp, err := otlptrace.New(req.Context(), mc)
+	exp, err := otlptrace.New(ctx, mc)
 	if err != nil {
-		return &TracedRequest{req, trace.NewNoopTracerProvider(), &NoopOtlpClient{}}
+		return &cfdTracer{trace.NewNoopTracerProvider(), &NoopOtlpClient{}, log}
 	}
 	tp := tracesdk.NewTracerProvider(
 		// We want to dump to in-memory exporter immediately
@@ -63,52 +121,137 @@ func NewTracedRequest(req *http.Request) *TracedRequest {
 		// Record information about this application in a Resource.
 		tracesdk.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceNameKey.String(service),
+			serviceAttribute,
+			otelVersionAttribute,
+			hostnameAttribute,
+			cloudflaredVersionAttribute,
+			HostOSAttribute,
+			HostArchAttribute,
 		)),
 	)
 
-	return &TracedRequest{req.WithContext(ctx), tp, mc}
+	return &cfdTracer{tp, mc, log}
 }
 
-func (cft *TracedRequest) Tracer() trace.Tracer {
+func (cft *cfdTracer) Tracer() trace.Tracer {
 	return cft.TracerProvider.Tracer(tracerInstrumentName)
 }
 
-// Spans returns the spans as base64 encoded protobuf otlp traces.
-func (cft *TracedRequest) Spans() (string, error) {
-	return cft.exporter.Spans()
+// GetSpans returns the spans as base64 encoded string of protobuf otlp traces.
+func (cft *cfdTracer) GetSpans() (enc string) {
+	enc, err := cft.exporter.Spans()
+	switch err {
+	case nil:
+		break
+	case errNoTraces:
+		cft.log.Trace().Err(err).Msgf("expected traces to be available")
+		return
+	case errNoopTracer:
+		return // noop tracer has no traces
+	default:
+		cft.log.Debug().Err(err)
+		return
+	}
+	return
 }
 
-// EndWithStatus will set a status for the span and then end it.
-func EndWithStatus(span trace.Span, code codes.Code, status string) {
+// AddSpans assigns spans as base64 encoded protobuf otlp traces to provided
+// HTTP headers.
+func (cft *cfdTracer) AddSpans(headers http.Header) {
+	if headers == nil {
+		return
+	}
+
+	enc := cft.GetSpans()
+	// No need to add header if no traces
+	if enc == "" {
+		return
+	}
+
+	headers[CanonicalCloudflaredTracingHeader] = []string{enc}
+}
+
+// EndWithErrorStatus will set a status for the span and then end it.
+func EndWithErrorStatus(span trace.Span, err error) {
+	endSpan(span, -1, codes.Error, err)
+}
+
+// EndWithStatusCode will set a status for the span and then end it.
+func EndWithStatusCode(span trace.Span, statusCode int) {
+	endSpan(span, statusCode, codes.Ok, nil)
+}
+
+// EndWithErrorStatus will set a status for the span and then end it.
+func endSpan(span trace.Span, upstreamStatusCode int, spanStatusCode codes.Code, err error) {
 	if span == nil {
 		return
 	}
-	span.SetStatus(code, status)
+
+	if upstreamStatusCode > 0 {
+		span.SetAttributes(attribute.Int(traceHttpStatusCodeKey, upstreamStatusCode))
+	}
+
+	// add error to status buf cap description
+	errDescription := ""
+	if err != nil {
+		errDescription = err.Error()
+		l := int(math.Min(float64(len(errDescription)), MaxErrorDescriptionLen))
+		errDescription = errDescription[:l]
+	}
+
+	span.SetStatus(spanStatusCode, errDescription)
 	span.End()
 }
 
-// extractTrace attempts to check for a cf-trace-id from a request header.
+// extractTraceFromString will extract the trace information from the provided
+// propagated trace string context.
+func extractTraceFromString(ctx context.Context, trace string) (context.Context, bool) {
+	if trace == "" {
+		return ctx, false
+	}
+	// Jaeger specific separator
+	parts := strings.Split(trace, separator)
+	if len(parts) != 4 {
+		return ctx, false
+	}
+	if parts[0] == "" {
+		return ctx, false
+	}
+	// Correctly left pad the trace to a length of 32
+	if len(parts[0]) < traceID128bitsWidth {
+		left := traceID128bitsWidth - len(parts[0])
+		parts[0] = strings.Repeat("0", left) + parts[0]
+		trace = strings.Join(parts, separator)
+	}
+
+	// Override the 'cf-trace-id' as 'uber-trace-id' so the jaeger propagator can extract it.
+	traceHeader := map[string]string{TracerContextNameOverride: trace}
+	remoteCtx := otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(traceHeader))
+	return remoteCtx, true
+}
+
+// extractTrace attempts to check for a cf-trace-id from a request and return the
+// trace context with the provided http.Request.
 func extractTrace(req *http.Request) (context.Context, bool) {
 	// Only add tracing for requests with appropriately tagged headers
-	remoteTraces := req.Header.Values(tracerContextName)
+	remoteTraces := req.Header.Values(TracerContextName)
 	if len(remoteTraces) <= 0 {
 		// Strip the cf-trace-id header
-		req.Header.Del(tracerContextName)
+		req.Header.Del(TracerContextName)
 		return nil, false
 	}
 
-	traceHeader := make(map[string]string, 1)
+	traceHeader := map[string]string{}
 	for _, t := range remoteTraces {
 		// Override the 'cf-trace-id' as 'uber-trace-id' so the jaeger propagator can extract it.
 		// Last entry wins if multiple provided
-		traceHeader[tracerContextNameOverride] = t
+		traceHeader[TracerContextNameOverride] = t
 	}
 
 	// Strip the cf-trace-id header
-	req.Header.Del(tracerContextName)
+	req.Header.Del(TracerContextName)
 
-	if traceHeader[tracerContextNameOverride] == "" {
+	if traceHeader[TracerContextNameOverride] == "" {
 		return nil, false
 	}
 	remoteCtx := otel.GetTextMapPropagator().Extract(req.Context(), propagation.MapCarrier(traceHeader))

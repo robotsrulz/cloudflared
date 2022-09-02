@@ -117,7 +117,7 @@ func (c *HTTP2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch connType {
 	case TypeControlStream:
-		if err := c.controlStreamHandler.ServeControlStream(r.Context(), respWriter, c.connOptions); err != nil {
+		if err := c.controlStreamHandler.ServeControlStream(r.Context(), respWriter, c.connOptions, c.orchestrator); err != nil {
 			c.controlStreamErr = err
 			c.log.Error().Err(err)
 			respWriter.WriteErrorResponse()
@@ -132,7 +132,7 @@ func (c *HTTP2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case TypeWebsocket, TypeHTTP:
 		stripWebsocketUpgradeHeader(r)
 		// Check for tracing on request
-		tr := tracing.NewTracedRequest(r)
+		tr := tracing.NewTracedHTTPRequest(r, c.log)
 		if err := originProxy.ProxyHTTP(respWriter, tr, connType == TypeWebsocket); err != nil {
 			err := fmt.Errorf("Failed to proxy HTTP: %w", err)
 			c.log.Error().Err(err)
@@ -149,9 +149,10 @@ func (c *HTTP2Connection) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		rws := NewHTTPResponseReadWriterAcker(respWriter, r)
 		if err := originProxy.ProxyTCP(r.Context(), rws, &TCPRequest{
-			Dest:    host,
-			CFRay:   FindCfRayHeader(r),
-			LBProbe: IsLBProbeRequest(r),
+			Dest:      host,
+			CFRay:     FindCfRayHeader(r),
+			LBProbe:   IsLBProbeRequest(r),
+			CfTraceID: r.Header.Get(tracing.TracerContextName),
 		}); err != nil {
 			respWriter.WriteErrorResponse()
 		}
@@ -190,11 +191,12 @@ func (c *HTTP2Connection) close() {
 }
 
 type http2RespWriter struct {
-	r           io.Reader
-	w           http.ResponseWriter
-	flusher     http.Flusher
-	shouldFlush bool
-	log         *zerolog.Logger
+	r             io.Reader
+	w             http.ResponseWriter
+	flusher       http.Flusher
+	shouldFlush   bool
+	statusWritten bool
+	log           *zerolog.Logger
 }
 
 func NewHTTP2RespWriter(r *http.Request, w http.ResponseWriter, connType Type, log *zerolog.Logger) (*http2RespWriter, error) {
@@ -218,17 +220,32 @@ func NewHTTP2RespWriter(r *http.Request, w http.ResponseWriter, connType Type, l
 	}, nil
 }
 
+func (rp *http2RespWriter) AddTrailer(trailerName, trailerValue string) {
+	if !rp.statusWritten {
+		rp.log.Warn().Msg("Tried to add Trailer to response before status written. Ignoring...")
+		return
+	}
+
+	rp.w.Header().Add(http2.TrailerPrefix+trailerName, trailerValue)
+}
+
 func (rp *http2RespWriter) WriteRespHeaders(status int, header http.Header) error {
 	dest := rp.w.Header()
 	userHeaders := make(http.Header, len(header))
 	for name, values := range header {
-		// Since these are http2 headers, they're required to be lowercase
+		// lowercase headers for simplicity check
 		h2name := strings.ToLower(name)
 
 		if h2name == "content-length" {
 			// This header has meaning in HTTP/2 and will be used by the edge,
 			// so it should be sent *also* as an HTTP/2 response header.
 			dest[name] = values
+		}
+
+		if h2name == tracing.IntCloudflaredTracingHeader {
+			// Add cf-int-cloudflared-tracing header outside of serialized userHeaders
+			dest[tracing.CanonicalCloudflaredTracingHeader] = values
+			continue
 		}
 
 		if !IsControlResponseHeader(h2name) || IsWebsocketClientHeader(h2name) {
@@ -240,18 +257,21 @@ func (rp *http2RespWriter) WriteRespHeaders(status int, header http.Header) erro
 
 	// Perform user header serialization and set them in the single header
 	dest.Set(CanonicalResponseUserHeaders, SerializeHeaders(userHeaders))
+
 	rp.setResponseMetaHeader(responseMetaHeaderOrigin)
 	// HTTP2 removes support for 101 Switching Protocols https://tools.ietf.org/html/rfc7540#section-8.1.1
 	if status == http.StatusSwitchingProtocols {
 		status = http.StatusOK
 	}
 	rp.w.WriteHeader(status)
-	if IsServerSentEvent(header) {
+	if shouldFlush(header) {
 		rp.shouldFlush = true
 	}
 	if rp.shouldFlush {
 		rp.flusher.Flush()
 	}
+
+	rp.statusWritten = true
 	return nil
 }
 

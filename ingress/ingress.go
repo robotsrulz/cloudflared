@@ -97,8 +97,16 @@ type WarpRoutingService struct {
 	Proxy StreamBasedOriginProxy
 }
 
-func NewWarpRoutingService() *WarpRoutingService {
-	return &WarpRoutingService{Proxy: &rawTCPService{name: ServiceWarpRouting}}
+func NewWarpRoutingService(config WarpRoutingConfig) *WarpRoutingService {
+	svc := &rawTCPService{
+		name: ServiceWarpRouting,
+		dialer: net.Dialer{
+			Timeout:   config.ConnectTimeout.Duration,
+			KeepAlive: config.TCPKeepAlive.Duration,
+		},
+	}
+
+	return &WarpRoutingService{Proxy: svc}
 }
 
 // Get a single origin service from the CLI/config.
@@ -174,11 +182,14 @@ func validateIngress(ingress []config.UnvalidatedIngressRule, defaults OriginReq
 			path := strings.TrimPrefix(r.Service, prefix)
 			service = &unixSocketPath{path: path, scheme: "https"}
 		} else if prefix := "http_status:"; strings.HasPrefix(r.Service, prefix) {
-			status, err := strconv.Atoi(strings.TrimPrefix(r.Service, prefix))
+			statusCode, err := strconv.Atoi(strings.TrimPrefix(r.Service, prefix))
 			if err != nil {
-				return Ingress{}, errors.Wrap(err, "invalid HTTP status")
+				return Ingress{}, errors.Wrap(err, "invalid HTTP status code")
 			}
-			srv := newStatusCode(status)
+			if statusCode < 100 || statusCode > 999 {
+				return Ingress{}, fmt.Errorf("invalid HTTP status code: %d", statusCode)
+			}
+			srv := newStatusCode(statusCode)
 			service = &srv
 		} else if r.Service == HelloWorldService || r.Service == "hello-world" || r.Service == "helloworld" {
 			service = new(helloWorld)
